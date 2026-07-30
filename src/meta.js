@@ -104,6 +104,8 @@ async function sendTemplate(sender, { to, templateName, language, variables, hea
   });
   return {
     ok: false,
+    status,
+    code: err.code ?? null,
     errorCode: err.code != null ? String(err.code) : String(status),
     errorMessage: (err.message || 'erro desconhecido').slice(0, 200),
     retryable,
@@ -142,7 +144,15 @@ async function sendText(sender, to, text) {
     status,
     code: err.code || null,
   });
-  return { ok: false, errorCode: err.code != null ? String(err.code) : String(status) };
+  // status e code precisam vir no retorno: e por eles que a fila decide se vale
+  // repetir. Sem isso, um "numero invalido" seria repetido cinco vezes.
+  return {
+    ok: false,
+    status,
+    code: err.code ?? null,
+    errorCode: err.code != null ? String(err.code) : String(status),
+    errorMessage: (err.message || '').slice(0, 200),
+  };
 }
 
 /** Lista templates aprovados da WABA. Metadado de conta — nao ha dado pessoal aqui. */

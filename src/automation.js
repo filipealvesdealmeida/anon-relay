@@ -35,6 +35,8 @@
 const meta = require('./meta');
 const store = require('./store');
 const log = require('./logging');
+const config = require('./config');
+const { sendWithRetry, senderBucket } = require('./queue');
 const { phoneKey } = require('./hashing');
 const { normalizeForMatch } = require('./optout');
 
@@ -133,20 +135,37 @@ async function run(jobId, sender, phone, automation) {
   if (atendidos.has(chave)) return { skipped: 'ja_atendido' };
   atendidos.set(chave, Date.now());
 
+  // Mesmo balde do disparo — o limite pertence ao número. Prioridade 1 porque
+  // isto é conversa em andamento: quem escreveu está do outro lado esperando,
+  // e não pode ficar atrás de milhares de mensagens frias na fila.
+  const bucket = senderBucket(sender.id, config.dispatch.ratePerSecond);
+
   let enviadas = 0;
   try {
     for (const [i, step] of automation.steps.entries()) {
       if (step.delaySeconds > 0) await sleep(step.delaySeconds * 1000);
 
-      const r = await meta.sendText(sender, phone, step.text);
-      if (r.ok) {
+      // Mesmas garantias do disparo: rate limit por número, 5 tentativas,
+      // backoff exponencial com jitter, e nada de repetir erro de validação.
+      const { resultado, retries } = await sendWithRetry(
+        () => meta.sendText(sender, phone, step.text),
+        {
+          attempts: config.dispatch.attempts,
+          backoffMs: config.dispatch.backoffMs,
+          bucket,
+          prioridade: 1,
+        }
+      );
+      if (retries) log.info('resposta automatica repetida', { jobId, passo: i + 1, retries });
+
+      if (resultado?.ok) {
         enviadas++;
         await store.incrJob(jobId, 'autoReplies', 1);
       } else {
-        // 131047 = janela de 24h fechada. Adiantar os próximos passos não
-        // adianta: eles falhariam igual.
-        await store.recordError(jobId, `auto:${r.errorCode}`);
-        log.warn('fluxo interrompido', { jobId, passo: i + 1, code: r.errorCode });
+        // 131047 = janela de 24h fechada. Seguir para os próximos passos não
+        // adianta: falhariam igual.
+        await store.recordError(jobId, `auto:${resultado?.errorCode || 'erro'}`);
+        log.warn('fluxo interrompido', { jobId, passo: i + 1, code: resultado?.errorCode });
         break;
       }
     }

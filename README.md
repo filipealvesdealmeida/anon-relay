@@ -118,6 +118,11 @@ dos números em disco.
 
 O preço está pago às claras: disparo interrompido não retoma.
 
+**Disparo e resposta automática dividem o mesmo balde.** São coisas diferentes —
+template fora da janela e mensagem de sessão dentro dos 24h — mas saem pelo
+mesmo número, e a Meta conta as duas juntas. A resposta entra com prioridade:
+quem escreveu está esperando, mensagem fria pode ceder a vez.
+
 Detalhes e a comparação item a item: `src/queue.js`.
 
 ## O que ele deliberadamente não faz

@@ -44,34 +44,137 @@ function isRetryable({ status, code }) {
 }
 
 /**
- * Token bucket por sender. Mantém a taxa mesmo quando a latência da Meta varia —
- * diferente de "dispare N e espere o segundo acabar", que perde vazão sempre que
- * uma requisição demora.
+ * Token bucket por sender, com fila de espera ordenada por prioridade.
+ *
+ * O limite pertence ao NÚMERO, não ao fluxo. Disparo e resposta automática
+ * saem pelo mesmo número e disputam o mesmo balde — é assim que tem que ser:
+ * a Meta conta as duas coisas juntas, e estourar o limite prejudica a
+ * reputação do número independentemente de qual fluxo causou.
+ *
+ * A prioridade existe porque as duas coisas não são igualmente urgentes:
+ * resposta a alguém que acabou de escrever é conversa em andamento; mensagem
+ * de disparo pode esperar dois segundos. Sem isso, uma pessoa que respondeu
+ * ficaria na fila atrás de 5.000 mensagens frias.
  */
 class TokenBucket {
   constructor(ratePerSecond) {
     this.rate = ratePerSecond;
     this.tokens = ratePerSecond;
     this.last = Date.now();
+    this.waiters = []; // { prioridade, seq, resolve }
+    this.seq = 0;
+    this.timer = null;
   }
 
-  /** Espera até ter permissão para mais um envio. */
-  async take() {
-    for (;;) {
-      const agora = Date.now();
-      this.tokens = Math.min(this.rate, this.tokens + ((agora - this.last) / 1000) * this.rate);
-      this.last = agora;
-      if (this.tokens >= 1) {
-        this.tokens -= 1;
-        return;
-      }
-      const esperaMs = Math.ceil(((1 - this.tokens) / this.rate) * 1000);
-      await new Promise((r) => setTimeout(r, Math.max(5, esperaMs)));
+  _refill() {
+    const agora = Date.now();
+    this.tokens = Math.min(this.rate, this.tokens + ((agora - this.last) / 1000) * this.rate);
+    this.last = agora;
+  }
+
+  _serve() {
+    this._refill();
+    // Maior prioridade primeiro; empate resolve por ordem de chegada.
+    this.waiters.sort((a, b) => b.prioridade - a.prioridade || a.seq - b.seq);
+    while (this.tokens >= 1 && this.waiters.length) {
+      this.tokens -= 1;
+      this.waiters.shift().resolve();
     }
+    if (this.waiters.length && !this.timer) {
+      const esperaMs = Math.max(5, Math.ceil(((1 - this.tokens) / this.rate) * 1000));
+      // Sem unref() de propósito: enquanto houver envio esperando permissão, o
+      // processo precisa continuar vivo. O timer só existe quando há fila e
+      // morre sozinho quando ela esvazia.
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this._serve();
+      }, esperaMs);
+    }
+  }
+
+  /**
+   * Espera permissão para mais um envio.
+   * @param {number} prioridade 0 = disparo, 1 = resposta em conversa aberta
+   */
+  take(prioridade = 0) {
+    this._refill();
+    if (this.tokens >= 1 && !this.waiters.length) {
+      this.tokens -= 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.waiters.push({ prioridade, seq: this.seq++, resolve });
+      this._serve();
+    });
   }
 }
 
+/**
+ * Um balde por número, compartilhado por todo o processo. É o que garante que
+ * disparo e automação não somem esforços para estourar o limite do mesmo
+ * número.
+ */
+const baldes = new Map(); // senderId -> TokenBucket
+
+function senderBucket(senderId, ratePerSecond) {
+  let b = baldes.get(senderId);
+  if (!b) {
+    b = new TokenBucket(ratePerSecond);
+    baldes.set(senderId, b);
+  } else if (ratePerSecond && b.rate !== ratePerSecond) {
+    // O disparo pode pedir um ritmo diferente; o balde acompanha.
+    b.rate = ratePerSecond;
+  }
+  return b;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Executa UM envio com as mesmas garantias da fila: espera o balde do número,
+ * repete erro transitório com backoff exponencial e jitter, desiste de erro de
+ * validação.
+ *
+ * É este o caminho comum entre o disparo e a resposta automática. Antes só o
+ * disparo tinha essas garantias, e uma enxurrada de respostas simultâneas saía
+ * sem controle nenhum pelo mesmo número.
+ *
+ * @param {Function} fn async () => { ok, status?, code?, retryable? }
+ */
+async function sendWithRetry(fn, opts = {}) {
+  const attempts = Math.max(1, opts.attempts || 5);
+  const backoffMs = opts.backoffMs || 2000;
+  const bucket = opts.bucket || null;
+  const prioridade = opts.prioridade || 0;
+  const shouldStop = opts.shouldStop || (() => false);
+
+  let resultado = null;
+  let retries = 0;
+
+  for (let tentativa = 1; tentativa <= attempts; tentativa++) {
+    if (shouldStop()) break;
+    if (bucket) await bucket.take(prioridade);
+
+    try {
+      resultado = await fn();
+    } catch (err) {
+      resultado = { ok: false, status: null, code: null, errorMessage: err.message };
+    }
+
+    if (resultado.ok) break;
+
+    const podeRepetir =
+      resultado.retryable !== undefined ? resultado.retryable : isRetryable(resultado);
+    if (!podeRepetir || tentativa === attempts) break;
+
+    retries++;
+    // Jitter: sem ele, tudo que tomou 429 junto volta junto e toma 429 de novo.
+    const base = backoffMs * 2 ** (tentativa - 1);
+    await sleep(Math.round(base * (0.75 + Math.random() * 0.5)));
+  }
+
+  return { resultado, retries };
+}
 
 /**
  * Executa uma lista de itens com concorrência, rate limit e retry.
@@ -88,21 +191,15 @@ async function runQueue(items, handler, opts = {}) {
   const concurrency = Math.max(1, opts.concurrency || 20);
   const attempts = Math.max(1, opts.attempts || 5);
   const backoffMs = opts.backoffMs || 2000;
-  const bucket = new TokenBucket(Math.max(1, opts.ratePerSecond || 12));
+  // Balde do número, compartilhado com a resposta automática do mesmo número.
+  const bucket = opts.senderId
+    ? senderBucket(opts.senderId, Math.max(1, opts.ratePerSecond || 12))
+    : new TokenBucket(Math.max(1, opts.ratePerSecond || 12));
   const onResult = opts.onResult || (() => {});
   const shouldStop = opts.shouldStop || (() => false);
 
   const stats = { processed: 0, ok: 0, failed: 0, retries: 0 };
   let cursor = 0;
-
-  /**
-   * Backoff exponencial com jitter. O jitter existe porque sem ele todas as
-   * mensagens que tomaram 429 juntas voltam juntas — e tomam 429 de novo.
-   */
-  function esperaDaTentativa(tentativa) {
-    const base = backoffMs * 2 ** (tentativa - 1);
-    return Math.round(base * (0.75 + Math.random() * 0.5));
-  }
 
   async function executor() {
     for (;;) {
@@ -114,26 +211,15 @@ async function runQueue(items, handler, opts = {}) {
       items[i] = null; // some da fila antes do primeiro await
       if (!item) continue;
 
-      let resultado = null;
-      for (let tentativa = 1; tentativa <= attempts; tentativa++) {
-        if (shouldStop()) return;
-        await bucket.take();
-
-        try {
-          resultado = await handler(item);
-        } catch (err) {
-          resultado = { ok: false, status: null, code: null, errorMessage: err.message };
-        }
-
-        if (resultado.ok) break;
-
-        const podeRepetir =
-          resultado.retryable !== undefined ? resultado.retryable : isRetryable(resultado);
-        if (!podeRepetir || tentativa === attempts) break;
-
-        stats.retries++;
-        await sleep(esperaDaTentativa(tentativa));
-      }
+      // Disparo entra com prioridade 0: cede a vez para conversa em andamento.
+      const { resultado, retries } = await sendWithRetry(() => handler(item), {
+        attempts,
+        backoffMs,
+        bucket,
+        prioridade: 0,
+        shouldStop,
+      });
+      stats.retries += retries;
 
       stats.processed++;
       if (resultado?.ok) stats.ok++;
@@ -155,4 +241,12 @@ async function runQueue(items, handler, opts = {}) {
   return stats;
 }
 
-module.exports = { runQueue, isRetryable, TokenBucket, RETRY_CODES };
+module.exports = {
+  runQueue,
+  sendWithRetry,
+  senderBucket,
+  isRetryable,
+  TokenBucket,
+  RETRY_CODES,
+  baldes,
+};

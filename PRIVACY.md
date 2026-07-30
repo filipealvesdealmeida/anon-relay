@@ -88,6 +88,11 @@ Se o disparo foi configurado para responder quem interage, o fluxo executa
 **neste instante**, com o telefone que acabou de chegar no webhook. Ele entra no
 escopo da função, as mensagens são enviadas, e a referência morre no fim.
 
+O envio dessas mensagens passa pelo mesmo controle do disparo: rate limit do
+número (a Meta conta disparo e resposta juntos), 5 tentativas e backoff
+exponencial. A diferença é a prioridade — quem respondeu não fica na fila atrás
+das mensagens frias.
+
 Os atrasos entre mensagens são temporizadores na memória do processo — não uma
 fila persistida. Isso é uma decisão, não uma limitação técnica: uma fila que
 sobrevivesse ao reinício seria uma cópia dos números gravada em disco.

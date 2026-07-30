@@ -128,6 +128,9 @@ async function run(jobId, sender, queue, spec) {
     },
     {
       concurrency: config.dispatch.concurrency,
+      // O balde é do número, não deste disparo: a resposta automática que sair
+      // por ele durante o envio disputa o mesmo limite (com prioridade maior).
+      senderId: sender.id,
       ratePerSecond: rate,
       attempts: config.dispatch.attempts,
       backoffMs: config.dispatch.backoffMs,

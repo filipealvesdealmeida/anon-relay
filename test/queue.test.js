@@ -178,3 +178,65 @@ test('a fila e os itens sao destruidos no fim', async () => {
   assert.equal(referencia.phone, null, 'o telefone do item foi apagado');
   assert.equal(referencia.variables, null);
 });
+
+// ── Disparo e resposta automática dividem o limite do número ──────────────
+
+test('o balde e do numero, compartilhado entre disparo e automacao', () => {
+  const { senderBucket, baldes } = require('../src/queue');
+  baldes.clear();
+  const a = senderBucket('5562999', 10);
+  const b = senderBucket('5562999', 10);
+  assert.equal(a, b, 'mesmo numero, mesmo balde');
+  assert.notEqual(a, senderBucket('5562888', 10), 'numeros diferentes, baldes diferentes');
+  baldes.clear();
+});
+
+test('conversa em andamento fura a fila do disparo', async () => {
+  const { TokenBucket } = require('../src/queue');
+  const bucket = new TokenBucket(5);
+  const ordem = [];
+
+  // Esgota os tokens iniciais.
+  for (let i = 0; i < 5; i++) await bucket.take(0);
+
+  // 10 mensagens de disparo entram na espera...
+  const disparos = Array.from({ length: 10 }, (_, i) =>
+    bucket.take(0).then(() => ordem.push('disparo' + i))
+  );
+  // ...e então alguém responde. A resposta não pode ficar atrás das 10.
+  await new Promise((r) => setTimeout(r, 10));
+  const resposta = bucket.take(1).then(() => ordem.push('resposta'));
+
+  await Promise.all([resposta, ...disparos]);
+
+  const posicao = ordem.indexOf('resposta');
+  assert.ok(posicao <= 1, `a resposta saiu na posicao ${posicao}, deveria vir na frente`);
+});
+
+test('automacao usa a mesma politica de retry do disparo', async () => {
+  const { sendWithRetry, TokenBucket } = require('../src/queue');
+  let n = 0;
+
+  // Erro transitório: repete.
+  const t = await sendWithRetry(
+    async () => {
+      n++;
+      return n < 3 ? { ok: false, status: 503 } : { ok: true };
+    },
+    { attempts: 5, backoffMs: 5, bucket: new TokenBucket(1000), prioridade: 1 }
+  );
+  assert.equal(t.resultado.ok, true);
+  assert.equal(t.retries, 2);
+
+  // Janela de 24h fechada (131047): erro de validação, não repete.
+  let m = 0;
+  const f = await sendWithRetry(
+    async () => {
+      m++;
+      return { ok: false, status: 400, code: 131047 };
+    },
+    { attempts: 5, backoffMs: 5, bucket: new TokenBucket(1000), prioridade: 1 }
+  );
+  assert.equal(m, 1, 'janela fechada nao adianta repetir');
+  assert.equal(f.resultado.ok, false);
+});
