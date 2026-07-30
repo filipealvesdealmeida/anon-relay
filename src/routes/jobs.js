@@ -23,8 +23,19 @@ const { optOutKey } = require('../hashing');
 const router = express.Router();
 router.use(requireTicket);
 
+/**
+ * Identificador do disparo, em grupos de 4 caracteres.
+ *
+ * Os hifens nao sao enfeite: sem eles o hex aleatorio produz, de vez em quando,
+ * oito digitos seguidos — e a varredura de retencao marcaria o proprio jobId
+ * como "coisa com formato de telefone". Um falso positivo desses aparece para o
+ * cliente exatamente na tela que existe pra provar que nao ha telefone
+ * guardado. Quebrando em grupos, nenhuma sequencia de digitos passa de 4, por
+ * construcao.
+ */
 function newJobId() {
-  return `${Date.now().toString(36)}-${crypto.randomBytes(6).toString('hex')}`;
+  const raw = Date.now().toString(36) + crypto.randomBytes(6).toString('hex');
+  return raw.match(/.{1,4}/g).join('-');
 }
 
 function sendersFor(req) {

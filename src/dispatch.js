@@ -25,13 +25,12 @@ const store = require('./store');
 const meta = require('./meta');
 const log = require('./logging');
 const csvLib = require('./csv');
+const { runQueue } = require('./queue');
 const { wamidKey, phoneKey, optOutKey } = require('./hashing');
 const config = require('./config');
 
 /** Jobs vivos neste processo. Nunca contem telefone apos o envio da posicao. */
 const active = new Map();
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function jobState(jobId) {
   const s = active.get(jobId);
@@ -77,85 +76,87 @@ async function run(jobId, sender, queue, spec) {
   active.set(jobId, state);
 
   await store.setJobStatus(jobId, 'sending', { startedAt: String(state.startedAt) });
-  log.info('disparo iniciado', { jobId, sender: sender.id, total: state.total, rate });
+  log.info('disparo iniciado', {
+    jobId,
+    sender: sender.id,
+    total: state.total,
+    rate,
+    concorrencia: config.dispatch.concurrency,
+    tentativas: config.dispatch.attempts,
+  });
 
-  let cursor = 0;
+  // Escritas no Redis são agregadas: um HINCRBY a cada lote, não um por
+  // mensagem. Mesma ideia do applyMetaStatusBatch do sistema principal.
   let pendingLinks = [];
   let pendingSent = 0;
   let pendingFailed = 0;
 
   async function flush() {
-    if (pendingLinks.length) {
-      await store.linkMessageBatch(pendingLinks);
-      pendingLinks = [];
-    }
-    const pipe = [];
-    if (pendingSent) pipe.push(store.incrJob(jobId, 'sent', pendingSent));
-    if (pendingFailed) pipe.push(store.incrJob(jobId, 'failed', pendingFailed));
+    const links = pendingLinks;
+    const s = pendingSent;
+    const f = pendingFailed;
+    pendingLinks = [];
     pendingSent = 0;
     pendingFailed = 0;
-    if (pipe.length) await Promise.all(pipe);
+    const tarefas = [];
+    if (links.length) tarefas.push(store.linkMessageBatch(links));
+    if (s) tarefas.push(store.incrJob(jobId, 'sent', s));
+    if (f) tarefas.push(store.incrJob(jobId, 'failed', f));
+    if (tarefas.length) await Promise.all(tarefas);
   }
 
-  while (cursor < queue.length && !state.cancelled) {
-    const windowStart = Date.now();
-    const slice = [];
-    for (let i = 0; i < rate && cursor < queue.length; i++, cursor++) {
-      const item = queue[cursor];
-      // Apaga a referencia ANTES do await: a partir daqui o numero so existe
-      // na variavel local desta iteracao.
-      queue[cursor] = null;
-      if (item) slice.push(item);
-    }
+  const flushTimer = setInterval(() => {
+    flush().catch((err) => log.error('flush falhou', { jobId, message: err.message }));
+  }, 1000);
+  flushTimer.unref();
 
-    await Promise.all(
-      slice.map(async (item) => {
-        try {
-          const result = await meta.sendTemplate(sender, {
-            to: item.phone,
-            templateName: spec.templateName,
-            language: spec.language,
-            variables: item.variables,
-            headerType: spec.headerType,
-            headerMediaUrl: spec.headerMediaUrl,
-            buttonUrlParam: spec.buttonUrlParam,
-          });
-
-          if (result.ok) {
-            pendingLinks.push([wamidKey(result.wamid), jobId]);
-            pendingSent++;
-            state.sent++;
-          } else {
-            pendingFailed++;
-            state.failed++;
-            await store.recordError(jobId, result.errorCode);
-            // Numero que a Meta declara inexistente/incapaz de receber entra na
-            // supressao — em forma de hash, como todo o resto.
-            if (['131026', '131052', '470'].includes(String(result.errorCode))) {
-              await store.suppress(optOutKey(item.phone));
-            }
-          }
-        } catch (err) {
-          pendingFailed++;
+  const stats = await runQueue(
+    queue,
+    // Handler de uma mensagem. O retorno diz à fila se vale repetir.
+    async (item) => {
+      const r = await meta.sendTemplate(sender, {
+        to: item.phone,
+        templateName: spec.templateName,
+        language: spec.language,
+        variables: item.variables,
+        headerType: spec.headerType,
+        headerMediaUrl: spec.headerMediaUrl,
+        buttonUrlParam: spec.buttonUrlParam,
+      });
+      // A referência ao wamid precisa sobreviver ao handler; o telefone, não.
+      return r.ok ? { ok: true, wamid: r.wamid } : { ...r, phone: item.phone };
+    },
+    {
+      concurrency: config.dispatch.concurrency,
+      ratePerSecond: rate,
+      attempts: config.dispatch.attempts,
+      backoffMs: config.dispatch.backoffMs,
+      shouldStop: () => state.cancelled,
+      onResult: async (result) => {
+        state.processed++;
+        if (result?.ok) {
+          state.sent++;
+          pendingSent++;
+          pendingLinks.push([wamidKey(result.wamid), jobId]);
+        } else {
           state.failed++;
-          log.warn('falha no envio', { jobId, message: err.message });
-        } finally {
-          state.processed++;
-          // Ultima referencia ao numero desta iteracao.
-          item.phone = null;
-          item.variables = null;
+          pendingFailed++;
+          await store.recordError(jobId, result?.errorCode);
+          // Número que a Meta declara incapaz de receber entra na supressão —
+          // em forma de hash, como todo o resto.
+          if (result?.phone && ['131026', '131052', '470'].includes(String(result.errorCode))) {
+            await store.suppress(optOutKey(result.phone));
+          }
+          if (result) result.phone = null;
         }
-      })
-    );
+      },
+    }
+  );
 
-    await flush();
-
-    const elapsed = Date.now() - windowStart;
-    if (cursor < queue.length && elapsed < 1000) await sleep(1000 - elapsed);
-  }
-
+  clearInterval(flushTimer);
   await flush();
   state.running = false;
+  if (stats.retries) log.info('tentativas repetidas', { jobId, retries: stats.retries });
 
   const status = state.cancelled ? 'cancelled' : 'sent';
   await store.setJobStatus(jobId, status, {

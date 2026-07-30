@@ -105,6 +105,21 @@ interrompido por restart não continua.
 
 Quem pede descadastro não recebe resposta automática.
 
+## Fila de envio
+
+Retry com backoff exponencial (5 tentativas, 2s → 32s, com jitter), rate limit
+por número via token bucket, concorrência controlada e cancelamento — as mesmas
+garantias que uma fila como BullMQ dá.
+
+Só que **em memória**, e essa é a única escolha possível: um job de fila
+persistida grava o payload no Redis, e o payload de um envio contém o telefone
+do destinatário. Uma fila que sobrevive a restart é, por definição, uma cópia
+dos números em disco.
+
+O preço está pago às claras: disparo interrompido não retoma.
+
+Detalhes e a comparação item a item: `src/queue.js`.
+
 ## O que ele deliberadamente não faz
 
 - Não guarda destinatário — nem cifrado, nem com prazo curto.
@@ -157,6 +172,7 @@ src/
 ├── logging.js       logger com redação obrigatória de dígitos e wamid
 ├── store.js         inventário completo do que é gravado no Redis
 ├── csv.js           parser próprio, em memória
+├── queue.js         retry, backoff, rate limit e concorrência — sem persistir
 ├── dispatch.js      ciclo de vida do número: entra, envia, some
 ├── automation.js    resposta automática sem memória de contato
 ├── meta.js          cliente da Cloud API (fetch nativo)

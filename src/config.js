@@ -97,6 +97,13 @@ const config = {
     // Mensagens por segundo por numero. A Meta aceita mais; o teto conservador
     // existe pra nao queimar reputacao do numero.
     ratePerSecond: int('DISPATCH_RATE_PER_SECOND', 12),
+    // Envios simultaneos. O rate limit e quem controla a vazao; a concorrencia
+    // existe pra manter a taxa quando a Meta responde devagar.
+    concurrency: int('DISPATCH_CONCURRENCY', 20),
+    // Mesma politica do BullMQ no sistema principal: 5 tentativas, backoff
+    // exponencial a partir de 2s (2s, 4s, 8s, 16s) com jitter.
+    attempts: int('DISPATCH_ATTEMPTS', 5),
+    backoffMs: int('DISPATCH_BACKOFF_MS', 2000),
     maxRecipientsPerJob: int('MAX_RECIPIENTS_PER_JOB', 50000),
     // Tamanho maximo do corpo do request (a lista chega como texto JSON).
     maxBodyBytes: int('MAX_BODY_BYTES', 12 * 1024 * 1024),

@@ -197,6 +197,24 @@ async function resolveMessage(wamidHash) {
   return redis.get(k.wamid(wamidHash));
 }
 
+/** Resolve varios de uma vez — 1 ida ao Redis em vez de N. */
+async function resolveMessages(hashes) {
+  if (!hashes.length) return [];
+  const pipe = redis.pipeline();
+  hashes.forEach((h) => pipe.get(k.wamid(h)));
+  const res = await pipe.exec();
+  return res.map((r) => r?.[1] || null);
+}
+
+/** Incrementa varios contadores do mesmo disparo numa tacada. */
+async function incrJobFields(jobId, fields) {
+  const entries = Object.entries(fields).filter(([, v]) => v > 0);
+  if (!entries.length) return;
+  const pipe = redis.pipeline();
+  entries.forEach(([campo, valor]) => pipe.hincrby(k.job(jobId), campo, valor));
+  await pipe.exec();
+}
+
 async function resolveSenderJob(senderId) {
   return redis.get(k.senderActive(senderId));
 }
@@ -295,6 +313,8 @@ module.exports = {
   linkMessage,
   linkMessageBatch,
   resolveMessage,
+  resolveMessages,
+  incrJobFields,
   resolveSenderJob,
   recordResponder,
   countResponders,

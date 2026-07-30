@@ -45,20 +45,39 @@ async function processWebhookPayload(body) {
       const senderId = value.metadata?.phone_number_id;
 
       // ── Status: entregue / lida / falhou ────────────────────────────────
-      for (const st of value.statuses || []) {
-        const jobId = await store.resolveMessage(wamidKey(st.id || ''));
-        if (!jobId) {
-          counts.ignorados++;
-          continue;
+      // Em lote, como o applyMetaStatusBatch do sistema principal: a Meta
+      // agrupa centenas de statuses por webhook, e resolver + incrementar um a
+      // um seriam centenas de idas ao Redis. Aqui é uma resolução em pipeline
+      // e um incremento por (disparo, campo).
+      const statuses = value.statuses || [];
+      if (statuses.length) {
+        const resolvidos = await store.resolveMessages(statuses.map((st) => wamidKey(st.id || '')));
+        const porJob = new Map(); // jobId -> { delivered, read, failed, erros: [] }
+
+        statuses.forEach((st, i) => {
+          const jobId = resolvidos[i];
+          if (!jobId) {
+            counts.ignorados++;
+            return;
+          }
+          const status = String(st.status || '').toLowerCase();
+          if (!['delivered', 'read', 'failed'].includes(status)) return;
+
+          if (!porJob.has(jobId)) porJob.set(jobId, { delivered: 0, read: 0, failed: 0, erros: [] });
+          const acc = porJob.get(jobId);
+          acc[status]++;
+          if (status === 'failed') acc.erros.push(st.errors?.[0]?.code);
+          counts.statuses++;
+        });
+
+        for (const [jobId, acc] of porJob) {
+          await store.incrJobFields(jobId, {
+            delivered: acc.delivered,
+            read: acc.read,
+            failed: acc.failed,
+          });
+          for (const code of acc.erros) await store.recordError(jobId, code);
         }
-        const status = String(st.status || '').toLowerCase();
-        if (status === 'delivered') await store.incrJob(jobId, 'delivered', 1);
-        else if (status === 'read') await store.incrJob(jobId, 'read', 1);
-        else if (status === 'failed') {
-          await store.incrJob(jobId, 'failed', 1);
-          await store.recordError(jobId, st.errors?.[0]?.code);
-        } else continue;
-        counts.statuses++;
       }
 
       // ── Inbound: alguem respondeu ───────────────────────────────────────
