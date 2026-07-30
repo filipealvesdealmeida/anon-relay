@@ -82,7 +82,29 @@ segredo compartilhado. Nos dois casos, o que este serviço faz com o telefone é
 exatamente o descrito na tabela acima — e evento sem assinatura válida é
 descartado.
 
-### Etapa 6 — O que resta
+### Etapa 6 — A resposta automática (quando o disparo tem uma)
+
+Se o disparo foi configurado para responder quem interage, o fluxo executa
+**neste instante**, com o telefone que acabou de chegar no webhook. Ele entra no
+escopo da função, as mensagens são enviadas, e a referência morre no fim.
+
+Os atrasos entre mensagens são temporizadores na memória do processo — não uma
+fila persistida. Isso é uma decisão, não uma limitação técnica: uma fila que
+sobrevivesse ao reinício seria uma cópia dos números gravada em disco.
+Consequência assumida: se o serviço reiniciar no meio de um fluxo, os passos
+restantes se perdem. Por isso os atrasos têm teto duro (1h entre mensagens, 4h
+no total).
+
+Para não responder a mesma pessoa a cada mensagem que ela mandar, o serviço
+guarda em memória `HMAC(telefone)` por disparo, por 12 horas. É anti-repetição,
+não histórico: some com o processo, e nem para isso o número precisa existir.
+
+Quem pediu descadastro **não** recebe resposta automática. O silêncio é a
+resposta certa.
+
+Verificável em: `src/automation.js`.
+
+### Etapa 7 — O que resta
 
 Contadores. `enviadas`, `entregues`, `lidas`, `respondidas`, `falhas`,
 `descadastros`. Nenhum endpoint deste serviço é capaz de responder "quem estava
@@ -142,6 +164,9 @@ também o "não quero mais receber" significaria recontatá-la no disparo seguin
 meio, o que faltava enviar se perde. Uma fila persistente resolveria — e seria
 exatamente a cópia dos números que este serviço promete não manter. O painel
 avisa isso antes de começar.
+
+**O mesmo vale para a resposta automática.** Fluxo em andamento no momento de um
+reinício não continua depois.
 
 **Não há histórico de destinatários.** Não é possível responder "esse número
 recebeu?" nem "quem respondeu?". A pergunta não tem onde ser respondida.

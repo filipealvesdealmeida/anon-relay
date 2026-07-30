@@ -25,7 +25,15 @@ function shape(job, responded, errors, live) {
   const delivered = num(job.delivered);
   const read = num(job.read);
   const optout = num(job.optout);
+  const autoReplies = num(job.autoReplies);
   const processed = live ? live.processed : sent + failed;
+  let automacao = null;
+  try {
+    const a = job.automation ? JSON.parse(job.automation) : null;
+    if (a?.enabled) automacao = { gatilho: a.trigger, mensagens: a.steps.length };
+  } catch (_) {
+    automacao = null;
+  }
 
   return {
     id: job.id,
@@ -49,7 +57,9 @@ function shape(job, responded, errors, live) {
       respondidas: responded,
       falhas: failed,
       descadastros: optout,
+      respostasAutomaticas: autoReplies,
     },
+    automacao,
     taxas: {
       entrega: pct(delivered, sent),
       leitura: pct(read, delivered),

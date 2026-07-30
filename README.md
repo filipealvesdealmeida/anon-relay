@@ -84,14 +84,32 @@ navegador                  relay                        Meta
     │                        │◄─ entregue / lida ──────────┤
     │                        ├─ +1 no contador             │
     │                        │                            │
+    │                        │◄─ alguém respondeu ─────────┤
+    │                        ├─ conta (HyperLogLog)        │
+    │                        ├─ responde o fluxo ─────────►│
+    │                        └─ esquece o número           │
+    │                        │                            │
     │◄── contadores ─────────┤                            │
 ```
+
+## Resposta automática
+
+O disparo pode levar um fluxo de até 5 mensagens para quem responder — por
+qualquer resposta, só ao apertar um botão do modelo, ou só por palavra-chave.
+
+O fluxo roda **na memória do processo**, com o telefone que acabou de chegar no
+webhook. Os atrasos entre mensagens são temporizadores, não uma fila persistida:
+uma fila que sobrevivesse ao reinício seria uma cópia dos números em disco. Por
+isso os atrasos têm teto (1h entre mensagens, 4h no total) e um fluxo
+interrompido por restart não continua.
+
+Quem pede descadastro não recebe resposta automática.
 
 ## O que ele deliberadamente não faz
 
 - Não guarda destinatário — nem cifrado, nem com prazo curto.
 - Não tem endpoint que devolva "quem estava na lista".
-- Não retoma disparo interrompido (fila persistente seria a cópia dos números).
+- Não retoma disparo nem fluxo interrompido (fila persistente seria a cópia dos números).
 - Não conhece o cliente: o ticket carrega um identificador derivado, não o usuário.
 
 ---
@@ -140,6 +158,7 @@ src/
 ├── store.js         inventário completo do que é gravado no Redis
 ├── csv.js           parser próprio, em memória
 ├── dispatch.js      ciclo de vida do número: entra, envia, some
+├── automation.js    resposta automática sem memória de contato
 ├── meta.js          cliente da Cloud API (fetch nativo)
 ├── optout.js        detecção de pedido de descadastro
 └── routes/

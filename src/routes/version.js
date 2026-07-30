@@ -74,7 +74,11 @@ router.get('/privacy/manifest', (req, res) => {
       motor: 'redis',
       finalidade: 'contadores agregados e indices derivados por HMAC',
       chaves: [
-        { padrao: 'job:<id>', conteudo: 'contadores e metadados do disparo', dadoPessoal: false },
+        {
+          padrao: 'job:<id>',
+          conteudo: 'contadores, metadados e a configuracao da resposta automatica (texto e gatilho, escritos pelo cliente)',
+          dadoPessoal: false,
+        },
         { padrao: 'job:<id>:resp', conteudo: 'HyperLogLog: quantos responderam, sem quem', dadoPessoal: false },
         { padrao: 'job:<id>:err', conteudo: 'contagem por codigo de erro da Meta', dadoPessoal: false },
         { padrao: 'tenant:<hash>:jobs', conteudo: 'indice de disparos do cliente', dadoPessoal: false },
@@ -92,6 +96,11 @@ router.get('/privacy/manifest', (req, res) => {
         descadastros: '5 anos (obrigacao de nao recontatar)',
       },
     },
+    emMemoriaApenas: [
+      'fila do disparo em andamento',
+      'fluxo da resposta automatica e seus atrasos',
+      'anti-repeticao da resposta automatica (HMAC do telefone, 12h)',
+    ],
     limiteDeclarado:
       'A chave de descadastro e HMAC do telefone com segredo fora do banco. Vazamento do banco sozinho nao revela nada. ' +
       'Um atacante que obtenha banco E segredo do processo consegue TESTAR se um numero especifico esta na lista de descadastro. ' +

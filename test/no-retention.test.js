@@ -14,6 +14,9 @@
  * Requer Redis local (o CI sobe um service container).
  */
 
+// Prefixo proprio: os arquivos de teste rodam em paralelo e a varredura daqui
+// olha TODAS as chaves do namespace — precisa ver so as suas.
+process.env.REDIS_PREFIX = (process.env.REDIS_PREFIX || 'anontest:').replace(/:$/, '') + '-ret:';
 require('./setup');
 const test = require('node:test');
 const assert = require('node:assert/strict');

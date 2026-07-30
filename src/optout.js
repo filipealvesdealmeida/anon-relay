@@ -36,7 +36,7 @@ const KEYWORDS = [
   'não tenho interesse',
 ];
 
-function normalize(text) {
+function normalizeForMatch(text) {
   return String(text || '')
     .toLowerCase()
     .normalize('NFD')
@@ -52,13 +52,13 @@ function normalize(text) {
  * opt-out.
  */
 function isOptOut(text) {
-  const t = normalize(text);
+  const t = normalizeForMatch(text);
   if (!t) return false;
   if (t.length <= 24 && KEYWORDS.includes(t)) return true;
   if (t.length <= 60) {
-    return KEYWORDS.some((k) => k.includes(' ') && t.includes(normalize(k)));
+    return KEYWORDS.some((k) => k.includes(' ') && t.includes(normalizeForMatch(k)));
   }
   return false;
 }
 
-module.exports = { isOptOut, KEYWORDS, normalize };
+module.exports = { isOptOut, KEYWORDS, normalizeForMatch };

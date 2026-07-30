@@ -29,12 +29,14 @@
 
 const store = require('./store');
 const dispatch = require('./dispatch');
+const automation = require('./automation');
+const meta = require('./meta');
 const log = require('./logging');
 const { wamidKey } = require('./hashing');
 const { isOptOut } = require('./optout');
 
 async function processWebhookPayload(body) {
-  const counts = { statuses: 0, respostas: 0, descadastros: 0, ignorados: 0 };
+  const counts = { statuses: 0, respostas: 0, descadastros: 0, automacoes: 0, ignorados: 0 };
   if (body?.object !== 'whatsapp_business_account') return counts;
 
   for (const entry of body.entry || []) {
@@ -77,15 +79,37 @@ async function processWebhookPayload(body) {
         await dispatch.registerResponder(jobId, from);
         counts.respostas++;
 
+        const isButton = !!(m.button || m.interactive?.button_reply);
         const text =
           m.text?.body ||
           m.button?.text ||
           m.interactive?.button_reply?.title ||
           m.interactive?.list_reply?.title ||
           '';
+
         if (isOptOut(text)) {
           await dispatch.registerOptOut(jobId, from);
           counts.descadastros++;
+          // Quem pediu para sair não recebe resposta automática. O silêncio é a
+          // resposta correta.
+          continue;
+        }
+
+        // ── Resposta automática ─────────────────────────────────────────────
+        // A automação pertence ao disparo. `from` entra no fluxo pelo closure e
+        // morre com ele — nada é gravado para isto funcionar.
+        const job = await store.getJob(jobId);
+        const config = store.parseAutomation(job);
+        if (config && automation.matches(config, { text, isButton })) {
+          const sender = meta.senderById(senderId);
+          if (sender) {
+            counts.automacoes++;
+            // Solto de propósito: o handler já respondeu 200 e os passos podem
+            // ter atraso entre si.
+            automation
+              .run(jobId, sender, from, config)
+              .catch((err) => log.error('automacao falhou', { jobId, message: err.message }));
+          }
         }
       }
     }

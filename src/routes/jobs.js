@@ -15,6 +15,7 @@ const store = require('../store');
 const csvLib = require('../csv');
 const dispatch = require('../dispatch');
 const meta = require('../meta');
+const automation = require('../automation');
 const log = require('../logging');
 const { requireTicket } = require('../ticket');
 const { optOutKey } = require('../hashing');
@@ -109,6 +110,7 @@ router.post('/jobs', async (req, res) => {
     headerMediaUrl,
     buttonUrlParam,
     ratePerSecond,
+    automation: automationInput,
   } = req.body || {};
 
   if (!req.allowedSenders.includes(String(senderId))) {
@@ -120,6 +122,11 @@ router.post('/jobs', async (req, res) => {
   if (typeof text !== 'string' || !text.trim()) {
     return res.status(400).json({ ok: false, error: 'csv vazio' });
   }
+
+  // Automacao invalida recusa o disparo inteiro: melhor errar aqui do que o
+  // cliente descobrir depois que ninguem recebeu resposta.
+  const auto = automation.validate(automationInput);
+  if (!auto.ok) return res.status(400).json({ ok: false, error: `resposta automatica: ${auto.error}` });
 
   try {
     const parsed = csvLib.parse(text, { maxRows: config.dispatch.maxRecipientsPerJob });
@@ -158,6 +165,7 @@ router.post('/jobs', async (req, res) => {
       templateName,
       label: String(label || '').slice(0, 60),
       total: queue.length,
+      automation: auto.automation,
       skippedSuppressed,
       skippedInvalid: parsed.stats.invalid,
       skippedDuplicate: parsed.stats.duplicate,
@@ -179,6 +187,9 @@ router.post('/jobs', async (req, res) => {
       ok: true,
       jobId,
       total: queue.length,
+      automacao: auto.automation
+        ? { gatilho: auto.automation.trigger, mensagens: auto.automation.steps.length }
+        : null,
       skipped: {
         suprimidos: skippedSuppressed,
         invalidos: parsed.stats.invalid,

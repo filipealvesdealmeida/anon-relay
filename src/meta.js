@@ -110,6 +110,41 @@ async function sendTemplate(sender, { to, templateName, language, variables, hea
   };
 }
 
+/**
+ * Envia texto livre (mensagem de sessao). So e permitido dentro da janela de 24h
+ * aberta por uma resposta do contato — que e exatamente o caso da automacao.
+ *
+ * Mesmo contrato do sendTemplate: `to` entra, nao sai. Nao aparece no retorno,
+ * nem em log, nem em metrica.
+ */
+async function sendText(sender, to, text) {
+  const { status, ok, body } = await metaFetch(`${BASE}/${sender.id}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sender.token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'text',
+      text: { body: String(text).slice(0, 4000), preview_url: false },
+    }),
+  });
+
+  if (ok && body?.messages?.[0]?.id) return { ok: true, wamid: body.messages[0].id };
+
+  const err = body?.error || {};
+  log.warn('resposta automatica recusada pela Meta', {
+    sender: sender.id,
+    to: maskPhone(to),
+    status,
+    code: err.code || null,
+  });
+  return { ok: false, errorCode: err.code != null ? String(err.code) : String(status) };
+}
+
 /** Lista templates aprovados da WABA. Metadado de conta — nao ha dado pessoal aqui. */
 async function listTemplates(sender) {
   if (!sender.wabaId) return { ok: false, error: 'sender sem wabaId configurado', templates: [] };
@@ -139,4 +174,4 @@ async function listTemplates(sender) {
   return { ok: true, templates };
 }
 
-module.exports = { sendTemplate, listTemplates, senderById, metaFetch, BASE };
+module.exports = { sendTemplate, sendText, listTemplates, senderById, metaFetch, BASE };

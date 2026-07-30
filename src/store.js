@@ -81,10 +81,15 @@ async function createJob(jobId, meta) {
     delivered: '0',
     read: '0',
     optout: '0',
+    autoReplies: '0',
     skippedSuppressed: String(meta.skippedSuppressed || 0),
     skippedInvalid: String(meta.skippedInvalid || 0),
     skippedDuplicate: String(meta.skippedDuplicate || 0),
   };
+  // Automacao do disparo: texto das mensagens e gatilho. E configuracao do
+  // cliente, nao dado de contato — por isso pode ficar guardada. Fica no proprio
+  // job porque e ele que o retorno da Meta identifica.
+  if (meta.automation) doc.automation = JSON.stringify(meta.automation);
   const pipe = redis.pipeline();
   pipe.hset(k.job(jobId), doc);
   pipe.expire(k.job(jobId), REPORT_TTL);
@@ -105,6 +110,17 @@ async function setJobStatus(jobId, status, extra = {}) {
 
 async function incrJob(jobId, field, by = 1) {
   await redis.hincrby(k.job(jobId), field, by);
+}
+
+/** Le a automacao gravada no job. Retorna null quando o disparo nao tem uma. */
+function parseAutomation(job) {
+  if (!job?.automation) return null;
+  try {
+    const a = JSON.parse(job.automation);
+    return a?.enabled ? a : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function getJob(jobId) {
@@ -269,6 +285,7 @@ module.exports = {
   ttl: { report: REPORT_TTL, wamid: WAMID_TTL, suppression: SUPPRESSION_TTL },
   createJob,
   setJobStatus,
+  parseAutomation,
   dayCount,
   addToDayCount,
   currentDay,
