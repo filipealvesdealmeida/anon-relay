@@ -1,48 +1,85 @@
 'use strict';
 
-require('./setup');
+/**
+ * O cofre: abre o que só ele pode abrir, e não devolve nada que reconstrua o
+ * número.
+ */
+
+const { encryptPhone } = require('./setup');
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('crypto');
+
 const h = require('../src/hashing');
 const ticket = require('../src/ticket');
 const log = require('../src/logging');
 
+const TELEFONE = '5562992287319';
 const WAMID = 'wamid.HBgNNTU2Mjk5MjI4NzMxORUCABEYEjczQzk5MkFCQ0RFRjEyMzQ1Ng==';
-const PHONE = '5562992287319';
 
-test('hash e deterministico e nao contem o valor de entrada', () => {
-  const a = h.wamidKey(WAMID);
-  const b = h.wamidKey(WAMID);
-  assert.equal(a, b);
-  assert.ok(!a.includes('5562'), 'hash nao pode conter digito do telefone');
-  assert.ok(!/\d{8,}/.test(a), 'hash nao pode ter sequencia com formato de telefone');
-  assert.equal(a.length, 22);
+// ── Cofre ──────────────────────────────────────────────────────────────────
+
+test('decifra o telefone que o sistema chamador cifrou', () => {
+  assert.equal(h.decryptPhone(encryptPhone(TELEFONE)), TELEFONE);
 });
 
-test('dominios diferentes produzem hashes diferentes pro mesmo valor', () => {
-  assert.notEqual(h.phoneKey(PHONE), h.optOutKey(PHONE));
-  assert.notEqual(h.phoneKey(PHONE), h.tenantKey(PHONE));
+test('o cifrado nao revela nada por si so', () => {
+  const enc = encryptPhone(TELEFONE);
+  assert.ok(!enc.includes(TELEFONE));
+  assert.ok(!/\d{8,}/.test(enc), 'nao tem sequencia com formato de telefone');
+  assert.notEqual(enc, encryptPhone(TELEFONE), 'cifragem e aleatorizada');
 });
 
-test('mascara de telefone nao permite reconstrucao', () => {
-  const m = h.maskPhone(PHONE);
-  assert.equal(m, '55 62 ********* (9)');
-  assert.ok(!m.includes('9228'));
+test('recusa conteudo que nao seja telefone', () => {
+  const lixo = crypto
+    .publicEncrypt(
+      { key: crypto.createPublicKey(require('./setup').publicKey), padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+      Buffer.from('rm -rf /', 'utf8')
+    )
+    .toString('base64');
+  assert.throws(() => h.decryptPhone(lixo), /nao e um telefone/);
+});
+
+test('recusa cifrado de outra chave', () => {
+  const outra = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+  const enc = crypto
+    .publicEncrypt(
+      { key: crypto.createPublicKey(outra.publicKey), padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
+      Buffer.from(TELEFONE, 'utf8')
+    )
+    .toString('base64');
+  assert.throws(() => h.decryptPhone(enc));
+});
+
+// ── O que sai do serviço ───────────────────────────────────────────────────
+
+test('o hash do wamid nao contem o telefone que o wamid embute', () => {
+  const chave = h.wamidKey(WAMID);
+  assert.equal(chave, h.wamidKey(WAMID), 'deterministico');
+  assert.ok(!chave.includes('5562'));
+  assert.ok(!/\d{8,}/.test(chave));
+  assert.equal(chave.length, 22);
+});
+
+test('mascara de log nao permite reconstrucao', () => {
+  assert.equal(h.maskPhone(TELEFONE), '55 62 ********* (9)');
 });
 
 test('logger apaga digitos longos e wamid', () => {
-  const redacted = log.redact({ to: PHONE, id: WAMID, texto: `ligar para ${PHONE}`, contador: 42 });
-  assert.ok(!JSON.stringify(redacted).includes('5562992287319'));
-  assert.ok(!JSON.stringify(redacted).includes('HBgNNTU2'));
-  assert.equal(redacted.contador, 42, 'numero pequeno permanece legivel');
+  const redigido = log.redact({ to: TELEFONE, id: WAMID, texto: `ligar para ${TELEFONE}`, contador: 42 });
+  const s = JSON.stringify(redigido);
+  assert.ok(!s.includes(TELEFONE));
+  assert.ok(!s.includes('HBgNNTU2'));
+  assert.equal(redigido.contador, 42);
 });
 
-test('logger redige dentro de estrutura aninhada', () => {
-  const out = log.redact({ entry: [{ changes: [{ value: { statuses: [{ recipient_id: PHONE }] } }] }] });
-  assert.ok(!JSON.stringify(out).includes(PHONE));
-});
+// ── Ticket ─────────────────────────────────────────────────────────────────
 
-test('ticket valido e aceito e carrega tenant e senders', () => {
+test('ticket valido carrega tenant e numeros permitidos', () => {
   const t = ticket.issue({ tenant: 'abc123', senders: ['999888777'] });
   const r = ticket.verify(t);
   assert.equal(r.ok, true);
@@ -52,14 +89,13 @@ test('ticket valido e aceito e carrega tenant e senders', () => {
 
 test('ticket adulterado e recusado', () => {
   const t = ticket.issue({ tenant: 'abc123', senders: [] });
-  const [v, body, sig] = t.split('.');
+  const [v, , sig] = t.split('.');
   const forjado = `${v}.${Buffer.from(JSON.stringify({ t: 'outro', exp: 9e9 })).toString('base64url')}.${sig}`;
   assert.equal(ticket.verify(forjado).ok, false);
 });
 
 test('ticket expirado e recusado', () => {
-  const t = ticket.issue({ tenant: 'abc123', senders: [], ttlSec: -10 });
-  const r = ticket.verify(t);
+  const r = ticket.verify(ticket.issue({ tenant: 'abc', senders: [], ttlSec: -10 }));
   assert.equal(r.ok, false);
   assert.match(r.error, /expirado/);
 });

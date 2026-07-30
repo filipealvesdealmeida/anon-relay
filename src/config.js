@@ -1,11 +1,8 @@
 'use strict';
 
 /**
- * Configuracao do relay. Tudo vem de variaveis de ambiente — nada e lido de
- * banco de dados, porque este servico nao tem banco de dados.
- *
- * Regra de ouro deste projeto: nenhum numero de telefone pode sobreviver ao
- * request que o trouxe. Toda escolha aqui existe pra sustentar isso.
+ * Configuração do relay. Tudo vem de variáveis de ambiente — nada é lido de
+ * banco de dados, porque este serviço não tem banco de dados. Nem disco.
  */
 
 require('dotenv').config();
@@ -25,11 +22,11 @@ function int(key, fallback) {
 }
 
 /**
- * ANON_SENDERS: JSON com os numeros dedicados ao modo anonimo.
+ * ANON_SENDERS: JSON com os números dedicados ao modo anônimo.
  * [{ "id": "<phoneNumberId>", "label": "Comercial 01", "wabaId": "...", "token": "EAAG..." }]
  *
- * Os tokens vivem SO aqui (env do container). O banco do sistema principal nao
- * participa deste fluxo em nenhum momento.
+ * Os tokens da Meta vivem SÓ aqui. O sistema que opera os disparos não os tem —
+ * ele não consegue enviar sozinho, nem abrir os números que guarda cifrados.
  */
 function parseSenders() {
   const raw = process.env.ANON_SENDERS;
@@ -57,65 +54,41 @@ function parseSenders() {
 
 const config = {
   port: int('PORT', 3020),
-  // Bind explicito. Sem isto o Node sobe so em IPv6 (::) em alguns ambientes e
-  // o mapeamento de porta do Docker, que fala IPv4, nao encontra o servico.
+  // Bind explícito. Sem isto o Node sobe só em IPv6 em alguns ambientes e o
+  // mapeamento de porta do Docker, que fala IPv4, não encontra o serviço.
   host: process.env.HOST || '0.0.0.0',
   env: process.env.NODE_ENV || 'development',
 
-  // Redis guarda EXCLUSIVAMENTE contadores agregados e chaves derivadas por HMAC.
-  // Nenhum valor gravado aqui permite reconstruir um numero de telefone.
-  redis: {
-    url: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
-    prefix: process.env.REDIS_PREFIX || 'anon:',
-    // Retencao dos contadores agregados (o dado pessoal ja nao existe;
-    // isto define por quanto tempo o relatorio continua disponivel).
-    reportTtlDays: int('REPORT_TTL_DAYS', 30),
-    // Janela em que um wamid ainda recebe callbacks de status.
-    wamidTtlHours: int('WAMID_TTL_HOURS', 72),
-  },
-
-  // Segredos de derivacao. Rotacionar invalida os indices existentes (por design:
-  // o dado antigo vira ruido irreversivel na hora).
   secrets: {
-    // Deriva chaves de indice a partir do wamid/telefone. 32 bytes hex.
+    // Única cópia da chave privada. É o que separa este processo de todos os
+    // outros: só ele abre os números que o sistema guarda cifrados.
+    privateKey: required('ANON_PRIVATE_KEY'),
+    // Deriva a chave de casamento do callback (HMAC do wamid).
     pepper: required('ANON_PEPPER'),
-    // Valida os tickets emitidos pelo sistema principal.
+    // Autentica as chamadas vindas do sistema que opera os disparos.
     ticket: required('ANON_TICKET_SECRET'),
   },
 
   meta: {
     graphVersion: process.env.META_GRAPH_VERSION || 'v21.0',
-    verifyToken: process.env.META_WEBHOOK_VERIFY_TOKEN || '',
-    // App secret do App Meta dono dos numeros anonimos. Quando presente, a
-    // assinatura X-Hub-Signature-256 do webhook e verificada.
-    appSecret: process.env.META_APP_SECRET || '',
   },
 
   senders: parseSenders(),
 
-  dispatch: {
-    // Mensagens por segundo por numero. A Meta aceita mais; o teto conservador
-    // existe pra nao queimar reputacao do numero.
-    ratePerSecond: int('DISPATCH_RATE_PER_SECOND', 12),
-    // Envios simultaneos. O rate limit e quem controla a vazao; a concorrencia
-    // existe pra manter a taxa quando a Meta responde devagar.
-    concurrency: int('DISPATCH_CONCURRENCY', 20),
-    // Mesma politica do BullMQ no sistema principal: 5 tentativas, backoff
-    // exponencial a partir de 2s (2s, 4s, 8s, 16s) com jitter.
-    attempts: int('DISPATCH_ATTEMPTS', 5),
-    backoffMs: int('DISPATCH_BACKOFF_MS', 2000),
-    maxRecipientsPerJob: int('MAX_RECIPIENTS_PER_JOB', 50000),
-    // Tamanho maximo do corpo do request (a lista chega como texto JSON).
-    maxBodyBytes: int('MAX_BODY_BYTES', 12 * 1024 * 1024),
+  send: {
+    // Teto de segurança por número. O rate limit principal é do lado de quem
+    // enfileira; este aqui é a última barreira, e vale porque é o único ponto
+    // que enxerga TODO o tráfego do número (disparo + resposta de automação).
+    ratePerSecond: int('SEND_RATE_PER_SECOND', 60),
+    maxBodyBytes: int('MAX_BODY_BYTES', 256 * 1024),
   },
 
-  // CORS: origem do painel /privado servido pelo sistema principal.
   allowedOrigins: (process.env.ALLOWED_ORIGINS || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
 
-  // Procedencia da imagem em execucao (injetados pelo workflow de deploy).
+  // Procedência da imagem em execução (injetados pelo workflow de deploy).
   build: {
     commit: process.env.BUILD_COMMIT || 'dev',
     imageDigest: process.env.IMAGE_DIGEST || 'dev',

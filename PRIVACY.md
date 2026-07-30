@@ -1,21 +1,22 @@
 # O caminho do dado
 
 Este documento descreve, passo a passo, o que acontece com um número de telefone
-que entra neste serviço. Ele é escrito para ser conferido contra o código, não
-para ser acreditado.
-
-Repositório público: todo o comportamento descrito aqui está em `src/`, em cerca
-de 1.200 linhas. A leitura completa leva menos de uma tarde.
+neste desenho. Ele é escrito para ser conferido contra o código, não para ser
+acreditado.
 
 ---
 
 ## 1. O princípio
 
-> Nenhum número de telefone sobrevive ao request que o trouxe.
+> O número é gravado cifrado com uma chave que o sistema operador não possui.
+> Só este serviço abre — e ele não tem onde guardar.
 
-Não é uma política interna nem uma promessa de retenção curta. É uma propriedade
-da arquitetura: não existe no serviço um lugar onde um número pudesse ser
-guardado, mesmo que alguém quisesse.
+Não é uma política interna nem uma promessa de retenção curta. São duas
+propriedades de arquitetura que se sustentam uma na outra:
+
+1. a cifra é **assimétrica** — quem grava não consegue reabrir;
+2. quem consegue reabrir **não tem armazenamento** — nem banco, nem fila, nem
+   disco gravável.
 
 ---
 
@@ -23,158 +24,135 @@ guardado, mesmo que alguém quisesse.
 
 ### Etapa 1 — A planilha sai do navegador
 
-O arquivo é lido **no seu navegador** e enviado como texto no corpo da
-requisição. Ele vai direto para o relay (`/anon-api/…`, roteado pelo Apache para
-a porta 3020) e **não passa pelo sistema principal** — nem pelo processo que tem
-banco de dados, nem pelo que grava conversas.
+O arquivo é lido **no navegador** e enviado como texto no corpo da requisição.
+Em conta anônima ele **não vira arquivo temporário** no servidor: o upload usa
+armazenamento em memória e o navegador reenvia a lista a cada etapa do
+assistente.
 
-Verificável em: `deploy/apache-anon.conf`.
+Verificável em: `server.js`, função `uploadCsv`.
 
-### Etapa 2 — Leitura em memória
+### Etapa 2 — O número é cifrado antes de encostar no banco
 
-O texto é analisado por um parser próprio (`src/csv.js`, sem dependência
-externa). Não há biblioteca de upload, não há diretório temporário, não há
-`fs.writeFile` em lugar nenhum do repositório.
+Logo após a limpeza da lista (normalização, deduplicação), cada telefone é
+substituído por dois valores:
 
-O container roda com o sistema de arquivos **somente leitura**
-(`read_only: true` em `deploy/docker-compose.yml`). Uma tentativa de escrita
-falharia no kernel, independentemente do que o código pedisse.
-
-### Etapa 3 — Normalização e checagem de descadastro
-
-Cada número é normalizado (formato brasileiro de 13 dígitos), duplicados são
-descartados e o conjunto é conferido contra a lista de descadastro — que guarda
-**hashes**, não números. A comparação acontece em memória.
-
-Verificável em: `src/csv.js`, `src/dispatch.js` (`prepare`).
-
-### Etapa 4 — Envio
-
-A lista fica numa fila **na memória do processo**. Para cada mensagem:
-
-1. o número é enviado à Meta (única saída legítima, é o destino da operação);
-2. a posição dele na fila é sobrescrita por `null` **antes** do envio começar;
-3. as variáveis locais são zeradas ao fim da iteração.
-
-Do envio sobra uma única coisa: `HMAC(wamid) → identificador do disparo`.
-
-Verificável em: `src/dispatch.js` (`run`).
-
-### Etapa 5 — Retornos da Meta (entregue, lida, respondida)
-
-Os webhooks da Meta **contêm** número de telefone em texto puro:
-`statuses[].recipient_id` e `messages[].from`. O que o serviço faz com cada um:
-
-| Campo | O que acontece |
+| Campo | Conteúdo |
 |---|---|
-| `recipient_id` | Não é lido. O disparo é identificado pelo HMAC do `wamid`, indexado no envio. |
-| `from` (resposta) | Vira hash e entra num HyperLogLog — estrutura que conta **quantos** responderam sem registrar **quem**. |
-| `from` (descadastro) | Vira hash na lista de supressão, para nunca mais receber. |
+| `phone` | `hmac:<HMAC do número>` — a chave de comparação |
+| `phoneEnc` | o número cifrado com a chave pública **deste** serviço |
 
-Verificável em: `src/webhook-processor.js` — 100 linhas, lidas de uma vez.
+A partir dessa linha, o número em claro não existe mais no processo do sistema
+operador. Ele consegue cifrar; a chave privada não está lá.
 
-**Duas origens possíveis para esses eventos.** A Meta permite uma URL de webhook
-por App. Quando os números anônimos têm App próprio, ela entrega direto aqui e a
-assinatura conferida é a dela (`X-Hub-Signature-256`). Quando dividem o App com
-outro sistema, a Meta entrega lá; aquele sistema separa os eventos dos números
-anônimos **antes de qualquer escrita** e os repassa para cá assinados com o
-segredo compartilhado. Nos dois casos, o que este serviço faz com o telefone é
-exatamente o descrito na tabela acima — e evento sem assinatura válida é
-descartado.
+Verificável em: `lib/anon-crypto.js` e o endpoint `process-csv` do sistema.
 
-### Etapa 6 — A resposta automática (quando o disparo tem uma)
+### Etapa 3 — Banco, fila e relatórios trabalham sem o número
 
-Se o disparo foi configurado para responder quem interage, o fluxo executa
-**neste instante**, com o telefone que acabou de chegar no webhook. Ele entra no
-escopo da função, as mensagens são enviadas, e a referência morre no fim.
+`Contact`, o payload do job no Redis, `Message`, `Conversation` e a blacklist
+guardam a chave `hmac:` — nunca o número. Toda consulta do sistema continua
+funcionando porque só o *valor* do campo mudou.
 
-O envio dessas mensagens passa pelo mesmo controle do disparo: rate limit do
-número (a Meta conta disparo e resposta juntos), 5 tentativas e backoff
-exponencial. A diferença é a prioridade — quem respondeu não fica na fila atrás
-das mensagens frias.
+Verificável em: `node scripts/anon-scan.js` no sistema operador, que lê o dado
+real e procura qualquer sequência com formato de telefone.
 
-Os atrasos entre mensagens são temporizadores na memória do processo — não uma
-fila persistida. Isso é uma decisão, não uma limitação técnica: uma fila que
-sobrevivesse ao reinício seria uma cópia dos números gravada em disco.
-Consequência assumida: se o serviço reiniciar no meio de um fluxo, os passos
-restantes se perdem. Por isso os atrasos têm teto duro (1h entre mensagens, 4h
-no total).
+### Etapa 4 — O envio
 
-Para não responder a mesma pessoa a cada mensagem que ela mandar, o serviço
-guarda em memória `HMAC(telefone)` por disparo, por 12 horas. É anti-repetição,
-não histórico: some com o processo, e nem para isso o número precisa existir.
+O worker chama `POST /send` deste serviço com o `phoneEnc`. Aqui:
 
-Quem pediu descadastro **não** recebe resposta automática. O silêncio é a
-resposta certa.
+1. o número é decifrado numa variável local;
+2. é entregue à Meta — a saída legítima, o destino da operação;
+3. a variável sai de escopo.
 
-Verificável em: `src/automation.js`.
+Não sobra nada porque não há onde sobrar: sem banco, sem fila, sem disco.
 
-### Etapa 7 — O que resta
+Verificável em: `src/routes/send.js` — a rota inteira cabe numa tela.
 
-Contadores. `enviadas`, `entregues`, `lidas`, `respondidas`, `falhas`,
-`descadastros`. Nenhum endpoint deste serviço é capaz de responder "quem estava
-na lista", porque a lista não existe em lugar nenhum depois do envio.
+### Etapa 5 — O que volta
 
----
+`HMAC(wamid)`. Nunca o `wamid`.
 
-## 3. Por que o `wamid` não é guardado
-
-O identificador que a Meta devolve em cada envio **contém o número do
-destinatário codificado em base64**:
+O identificador que a Meta devolve embute o telefone do destinatário em base64:
 
 ```
 wamid.HBgNNTU2Mjk5MjIyMjIyMhUCABEYEjc...
              └── "5562992222222" em base64
 ```
 
-Guardar o `wamid` seria guardar o telefone. Por isso o índice armazena
-`HMAC-SHA256(wamid, pepper)` truncado em 128 bits.
+Devolvê-lo seria entregar de volta o número que nos foi confiado cifrado. O hash
+serve para casar o callback de entrega e leitura, e não reconstrói nada.
 
 Duas propriedades:
 
-1. **Sem o segredo**, a chave é ruído — um vazamento do banco não entrega nada.
-2. **Mesmo com o segredo vazado**, o `wamid` tem um sufixo aleatório de alta
-   entropia (identificador único da mensagem, imprevisível). Não há espaço de
-   candidatos para testar, como haveria com um telefone.
+1. **Sem o segredo**, é ruído.
+2. **Mesmo com o segredo vazado**, o `wamid` tem sufixo aleatório de alta
+   entropia — não há espaço de candidatos para testar, como haveria com um
+   telefone. É a chave mais forte do sistema.
 
-O segredo (`ANON_PEPPER`) vive na variável de ambiente do container, nunca junto
-dos dados.
+### Etapa 6 — Os retornos da Meta
+
+Entregas, leituras e respostas chegam ao webhook do sistema operador. O payload
+**contém** telefone em texto puro (`statuses[].recipient_id`, `messages[].from`)
+— e é ali que ele para:
+
+| Campo | O que acontece |
+|---|---|
+| `recipient_id` | Não é lido. A mensagem é identificada pelo HMAC do `wamid`. |
+| `from` (resposta) | Vira chave `hmac:` e número cifrado na mesma linha; o valor cru sai de escopo no fim da função. |
+
+Verificável em: `worker.js`, `processMetaWebhook` e `processMetaInboundMessage`.
+
+---
+
+## 3. O que um vazamento revelaria
+
+| Cenário | O que o atacante obtém |
+|---|---|
+| Dump do Mongo | Chaves `hmac:` e blobs cifrados. Nenhum número. |
+| Backup do Redis | Payloads de job com chave e cifrado. Nenhum número. |
+| `.env` do sistema operador | A chave **pública**. Não abre nada. |
+| Banco **e** `.env` do operador | Ainda nenhum número: falta a chave privada. |
+| `.env` deste serviço (chave privada) | Consegue abrir os cifrados **se também tiver o banco**. |
+| Banco **e** pepper | Consegue *testar* se um número específico está numa lista (ver limite abaixo). |
 
 ---
 
 ## 4. O limite — dito sem rodeio
 
-**O que esta arquitetura prova:** que a imagem publicada veio daquele código
-(atestado de procedência, Sigstore) e que a produção declara estar rodando
-aquela imagem (`/version` × digest da release).
+**O que esta arquitetura prova:** que o número é gravado cifrado com uma chave
+ausente do sistema que o grava; que o único processo capaz de abri-lo não tem
+armazenamento; e que a imagem dele veio de um código público, com atestado de
+procedência.
 
-**O que ela não prova:** o que executa dentro do servidor no nível do processador.
-Provar isso exigiria *confidential computing* (TEE/enclaves) — desproporcional
-para este caso. Quem fecha esse resíduo é o contrato de operador (LGPD), com
-cláusula expressa de não-retenção.
+**O que ela não prova:** o que executa dentro do servidor no nível do
+processador. Provar isso exigiria *confidential computing* (TEE/enclaves) —
+desproporcional para este caso.
 
-**Onde o anonimato é mais fraco:** a lista de descadastro guarda
-`HMAC(telefone, pepper)`. O espaço de números brasileiros é pequeno (~10¹⁰).
-Um atacante com **banco e segredo do processo** conseguiria testar se um número
-específico está na lista. Nenhuma outra chave do sistema tem essa propriedade.
+**Onde o anonimato é mais fraco:** o HMAC. Para deduplicar listas, respeitar
+descadastros e não responder duas vezes à mesma pessoa, o sistema precisa
+responder "é a mesma pessoa?" — e cifra aleatorizada não responde isso. O HMAC
+responde, ao custo de ser determinístico. Como o espaço de números brasileiros é
+pequeno (~10¹⁰), quem tivesse o banco **e** o pepper conseguiria testar se um
+número específico está numa lista. O `phoneEnc` não tem essa fraqueza.
 
-Esse trecho existe porque a alternativa é pior para a própria pessoa: esquecer
-também o "não quero mais receber" significaria recontatá-la no disparo seguinte.
+**Uma ressalva de operação:** este serviço e o sistema operador rodam hoje na
+mesma máquina. A separação de chaves protege contra vazamento de banco, de
+backup e de dump — não contra quem já tem root na VPS naquele instante. Separar
+em máquinas diferentes é uma mudança de configuração, não de código.
+
+**O que fecha o resto:** o contrato de operador (LGPD), com cláusula expressa de
+não-retenção.
 
 ---
 
-## 5. O que é assumido como custo
+## 5. Retenção declarada
 
-**Um disparo interrompido não pode ser retomado.** Se o processo reiniciar no
-meio, o que faltava enviar se perde. Uma fila persistente resolveria — e seria
-exatamente a cópia dos números que este serviço promete não manter. O painel
-avisa isso antes de começar.
-
-**O mesmo vale para a resposta automática.** Fluxo em andamento no momento de um
-reinício não continua depois.
-
-**Não há histórico de destinatários.** Não é possível responder "esse número
-recebeu?" nem "quem respondeu?". A pergunta não tem onde ser respondida.
+| Dado | Onde | Prazo |
+|---|---|---|
+| Número de telefone em claro | em lugar nenhum | — |
+| Número cifrado (`phoneEnc`) | banco do sistema operador | enquanto o disparo existir |
+| Chave `hmac:` | banco do sistema operador | enquanto o disparo existir |
+| `HMAC(wamid)` | banco do sistema operador | enquanto a mensagem existir |
+| Qualquer coisa | **neste serviço** | **nada é guardado** |
 
 ---
 
@@ -184,41 +162,27 @@ recebeu?" nem "quem respondeu?". A pergunta não tem onde ser respondida.
 # 1. A imagem em produção veio deste repositório?
 gh attestation verify oci://ghcr.io/<owner>/anon-relay@<digest> --owner <owner>
 
-# 2. Qual digest está no registry?
-docker buildx imagetools inspect ghcr.io/<owner>/anon-relay:<tag>
-
-# 3. A produção declara rodar esse digest?
+# 2. A produção declara rodar esse digest?
 curl -s https://<dominio>/anon-api/version
 
-# 4. O que o serviço guarda, segundo ele mesmo?
+# 3. O que este serviço guarda, segundo ele mesmo?
 curl -s https://<dominio>/anon-api/privacy/manifest
 
-# 5. Varredura ao vivo do armazenamento atrás de telefone
-curl -s https://<dominio>/anon-api/privacy/scan
+# 4. E o sistema operador — guarda algum número em claro?
+node scripts/anon-scan.js       # lá, no sistema; espera-se "achados: 0"
+
+# 5. O sistema operador realmente não consegue decifrar?
+node scripts/anon-selftest.js   # a verificação que passa quando falha
 ```
 
-O passo 5 é o mais direto: a varredura roda no dado real, no momento em que você
-pergunta, e devolve `achados: []`.
-
 ---
 
-## 7. Retenção declarada
+## 7. Solicitações de titular (LGPD, art. 18)
 
-| Dado | Prazo | Motivo |
-|---|---|---|
-| Contadores do relatório | 30 dias | disponibilidade do relatório |
-| `HMAC(wamid) → disparo` | 72 horas | janela em que a Meta ainda envia status |
-| `HMAC(telefone)` de descadastro | 5 anos | obrigação de não recontatar |
-| Número de telefone | **nenhum** | não é gravado em momento algum |
-
----
-
-## 8. Encarregado e contato
-
-Solicitações de titular (LGPD, art. 18) sobre este serviço têm uma resposta
-incomum e verificável: não há dado pessoal armazenado a ser exibido, corrigido
-ou excluído — exceto o pedido de descadastro, que é justamente o que a pessoa
-solicitou preservar.
+A resposta é incomum e verificável: não há número de telefone armazenado a ser
+exibido, corrigido ou excluído. O que existe é um valor cifrado, ilegível para
+quem o guarda, e um hash usado para respeitar descadastros — que é justamente o
+que a pessoa pediu para ser preservado, quando pediu.
 
 O contrato de operador que acompanha a contratação formaliza a não-retenção e
 nomeia o responsável.

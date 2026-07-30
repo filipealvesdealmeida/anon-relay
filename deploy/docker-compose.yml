@@ -8,6 +8,9 @@
 # Uso na VPS:
 #   docker compose --env-file .env --env-file .env.build up -d
 # (.env.build e escrito pelo workflow de deploy com o digest da imagem)
+#
+# Escuta so no loopback: quem chama e o worker do sistema operador, na mesma
+# maquina. Nao precisa ser exposto a internet.
 
 services:
   anon-relay:
@@ -24,21 +27,12 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3020
-      REDIS_URL: ${REDIS_URL}
-      REDIS_PREFIX: ${REDIS_PREFIX:-anon:}
-      REPORT_TTL_DAYS: ${REPORT_TTL_DAYS:-30}
-      WAMID_TTL_HOURS: ${WAMID_TTL_HOURS:-72}
+      ANON_PRIVATE_KEY: ${ANON_PRIVATE_KEY}
       ANON_PEPPER: ${ANON_PEPPER}
       ANON_TICKET_SECRET: ${ANON_TICKET_SECRET}
       META_GRAPH_VERSION: ${META_GRAPH_VERSION:-v21.0}
-      META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN}
-      META_APP_SECRET: ${META_APP_SECRET}
       ANON_SENDERS: ${ANON_SENDERS}
-      DISPATCH_RATE_PER_SECOND: ${DISPATCH_RATE_PER_SECOND:-12}
-      DISPATCH_CONCURRENCY: ${DISPATCH_CONCURRENCY:-20}
-      DISPATCH_ATTEMPTS: ${DISPATCH_ATTEMPTS:-5}
-      DISPATCH_BACKOFF_MS: ${DISPATCH_BACKOFF_MS:-2000}
-      MAX_RECIPIENTS_PER_JOB: ${MAX_RECIPIENTS_PER_JOB:-50000}
+      SEND_RATE_PER_SECOND: ${SEND_RATE_PER_SECOND:-60}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
       BUILD_COMMIT: ${BUILD_COMMIT}
       IMAGE_DIGEST: ${IMAGE_DIGEST}

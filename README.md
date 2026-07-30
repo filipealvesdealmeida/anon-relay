@@ -1,21 +1,61 @@
 # anon-relay
 
-Disparo de WhatsApp com **retenção zero de números**. A lista chega, as
-mensagens saem, o número é descartado. O que resta é contagem: enviadas,
-entregues, lidas, respondidas.
+O cofre de envio: o único processo com a chave privada que abre um número de
+telefone — e o único sem qualquer armazenamento.
 
-O serviço é pequeno de propósito — três dependências, nenhum banco de dados,
-nenhuma escrita em disco. A ideia é que você não precise acreditar em ninguém:
-leia `src/` numa tarde e verifique você mesmo.
+O sistema que opera os disparos guarda cada telefone **cifrado** com a chave
+pública deste serviço. Ele consegue cifrar e não consegue abrir. Quando chega a
+hora de enviar, chama aqui: decifra em memória, entrega à Meta, devolve um hash
+e esquece.
+
+Três dependências, nenhum banco, nenhuma fila, disco somente leitura. Dá para
+ler o repositório inteiro numa tarde.
 
 - **O caminho do dado, etapa por etapa:** [PRIVACY.md](PRIVACY.md)
 - **Código que roda em produção:** este repositório, no commit que `/version` declara
 
 ---
 
+## O que ele faz
+
+```
+sistema chamador                 cofre                        Meta
+      │                            │                            │
+      ├── telefone CIFRADO ───────►│                            │
+      │                            ├─ decifra em memória        │
+      │                            ├─ envia ───────────────────►│
+      │                            │◄─ wamid ────────────────────┤
+      │◄── HMAC(wamid) ────────────┤                            │
+      │                            └─ a variável sai de escopo   │
+```
+
+O `wamid` não volta de propósito: ele embute o telefone do destinatário em
+base64, e devolvê-lo desfaria todo o cuidado do caminho. O hash serve para casar
+o callback de entrega e leitura depois — e não reconstrói nada.
+
+## O que ele deliberadamente não tem
+
+- Banco de dados, fila, cache — **nenhum armazenamento**
+- Escrita em disco (o container roda `read_only: true`)
+- Qualquer rota que liste, busque ou devolva um destinatário
+- Conhecimento de quem é o cliente: o ticket carrega um identificador derivado
+
+## Rotas
+
+```
+GET  /health              saúde
+GET  /version             commit + digest da imagem em execução
+GET  /privacy/manifest    o que este serviço guarda (resposta: nada)
+POST /send                decifra, envia, devolve HMAC(wamid)   [ticket]
+GET  /templates           templates aprovados                   [ticket]
+GET  /senders             números disponíveis                   [ticket]
+```
+
+---
+
 ## Como auditar
 
-Três comandos. Nenhum deles depende de quem opera o servidor.
+Três comandos. Nenhum depende de quem opera o servidor.
 
 ### 1. A imagem em produção veio deste código?
 
@@ -23,10 +63,8 @@ Três comandos. Nenhum deles depende de quem opera o servidor.
 gh attestation verify oci://ghcr.io/<owner>/anon-relay@<digest> --owner <owner>
 ```
 
-O atestado é gerado pelo GitHub Actions no momento do build, assinado via
-Sigstore, e liga aquele digest a um commit específico e a uma execução pública
-do workflow. Não existe caminho para publicar uma imagem diferente do código
-sem que o atestado deixe de bater.
+O atestado é gerado pelo GitHub Actions no build, assinado via Sigstore, e liga
+aquele digest a um commit específico e a uma execução pública do workflow.
 
 ### 2. Qual é o digest publicado?
 
@@ -40,109 +78,29 @@ docker buildx imagetools inspect ghcr.io/<owner>/anon-relay:<tag>
 curl -s https://<dominio>/anon-api/version
 ```
 
-```json
-{
-  "commit": "a31f89c…",
-  "image_digest": "sha256:9f2b…",
-  "deployed_at": "2026-07-30T09:32:00Z",
-  "source": "https://github.com/<owner>/anon-relay/tree/a31f89c…"
-}
-```
-
 Se os três batem, o que roda em produção é o código que você acabou de ler.
 
-### Bônus: a varredura ao vivo
+### Bônus: o manifesto
 
 ```bash
-curl -s https://<dominio>/anon-api/privacy/scan
+curl -s https://<dominio>/anon-api/privacy/manifest
 ```
 
-Lê **todas** as chaves do armazenamento e procura qualquer sequência com
-formato de telefone, em nome de chave ou em valor. Roda no dado real, no
-momento em que você pergunta.
-
-```json
-{ "ok": true, "chavesVarridas": 1284, "achados": [] }
-```
-
----
-
-## O que o serviço faz
-
-```
-navegador                  relay                        Meta
-    │                        │                            │
-    ├── planilha (texto) ───►│                            │
-    │                        ├─ parse em memória          │
-    │                        ├─ normaliza, dedup          │
-    │                        ├─ filtra descadastro (hash) │
-    │                        ├─ envia ────────────────────►
-    │                        │◄─ wamid ────────────────────┤
-    │                        ├─ grava HMAC(wamid) → job    │
-    │                        └─ descarta o número          │
-    │                        │                            │
-    │                        │◄─ entregue / lida ──────────┤
-    │                        ├─ +1 no contador             │
-    │                        │                            │
-    │                        │◄─ alguém respondeu ─────────┤
-    │                        ├─ conta (HyperLogLog)        │
-    │                        ├─ responde o fluxo ─────────►│
-    │                        └─ esquece o número           │
-    │                        │                            │
-    │◄── contadores ─────────┤                            │
-```
-
-## Resposta automática
-
-O disparo pode levar um fluxo de até 5 mensagens para quem responder — por
-qualquer resposta, só ao apertar um botão do modelo, ou só por palavra-chave.
-
-O fluxo roda **na memória do processo**, com o telefone que acabou de chegar no
-webhook. Os atrasos entre mensagens são temporizadores, não uma fila persistida:
-uma fila que sobrevivesse ao reinício seria uma cópia dos números em disco. Por
-isso os atrasos têm teto (1h entre mensagens, 4h no total) e um fluxo
-interrompido por restart não continua.
-
-Quem pede descadastro não recebe resposta automática.
-
-## Fila de envio
-
-Retry com backoff exponencial (5 tentativas, 2s → 32s, com jitter), rate limit
-por número via token bucket, concorrência controlada e cancelamento — as mesmas
-garantias que uma fila como BullMQ dá.
-
-Só que **em memória**, e essa é a única escolha possível: um job de fila
-persistida grava o payload no Redis, e o payload de um envio contém o telefone
-do destinatário. Uma fila que sobrevive a restart é, por definição, uma cópia
-dos números em disco.
-
-O preço está pago às claras: disparo interrompido não retoma.
-
-**Disparo e resposta automática dividem o mesmo balde.** São coisas diferentes —
-template fora da janela e mensagem de sessão dentro dos 24h — mas saem pelo
-mesmo número, e a Meta conta as duas juntas. A resposta entra com prioridade:
-quem escreveu está esperando, mensagem fria pode ceder a vez.
-
-Detalhes e a comparação item a item: `src/queue.js`.
-
-## O que ele deliberadamente não faz
-
-- Não guarda destinatário — nem cifrado, nem com prazo curto.
-- Não tem endpoint que devolva "quem estava na lista".
-- Não retoma disparo nem fluxo interrompido (fila persistente seria a cópia dos números).
-- Não conhece o cliente: o ticket carrega um identificador derivado, não o usuário.
+A lista de dependências e a ausência de drivers de banco são lidas do processo
+em execução, não escritas à mão. Se alguém adicionar um, aparece ali sozinho.
 
 ---
 
 ## Rodando local
 
 ```bash
-cp .env.example .env      # preencha ANON_PEPPER, ANON_TICKET_SECRET, ANON_SENDERS
+cp .env.example .env      # preencha ANON_PRIVATE_KEY, ANON_PEPPER, ANON_SENDERS
 npm install
 npm start
 ```
 
-Requer Redis. Gere os segredos com `openssl rand -hex 32`.
+Gere o par de chaves com o `scripts/anon-keygen.js` do sistema chamador — ele
+imprime a privada para cá e a pública para lá.
 
 ## Testes
 
@@ -150,10 +108,8 @@ Requer Redis. Gere os segredos com `openssl rand -hex 32`.
 npm test
 ```
 
-Inclui `test/no-retention.test.js`: roda um disparo completo contra uma Meta
-simulada e varre todo o armazenamento atrás de qualquer coisa com formato de
-telefone. Se alguém introduzir uma escrita que guarde número, o teste quebra —
-e o CI reprova antes de qualquer imagem ser publicada.
+Cobrem o cofre (decifra o que deve, recusa o que não deve), o contrato de
+`/send` (nunca devolve wamid nem telefone) e o teto de segurança por número.
 
 ## Deploy
 
@@ -173,21 +129,23 @@ repositório.
 src/
 ├── server.js        montagem do express e rotas
 ├── config.js        toda a configuração vem de env — não há banco
-├── hashing.js       derivação HMAC (e por que o wamid não pode ser guardado)
-├── logging.js       logger com redação obrigatória de dígitos e wamid
-├── store.js         inventário completo do que é gravado no Redis
-├── csv.js           parser próprio, em memória
-├── queue.js         retry, backoff, rate limit e concorrência — sem persistir
-├── dispatch.js      ciclo de vida do número: entra, envia, some
-├── automation.js    resposta automática sem memória de contato
+├── hashing.js       o cofre: decifra, e por que o wamid não volta em claro
+├── rate.js          teto de segurança por número, com prioridade
 ├── meta.js          cliente da Cloud API (fetch nativo)
-├── optout.js        detecção de pedido de descadastro
+├── ticket.js        autenticação das chamadas do sistema chamador
+├── logging.js       logger com redação obrigatória de dígitos e wamid
 └── routes/
-    ├── jobs.js      disparo (exige ticket)
-    ├── report.js    contadores (exige ticket)
-    ├── webhook.js   retornos da Meta — 90 linhas, leia inteiro
-    └── version.js   /version, /privacy/manifest, /privacy/scan
+    ├── send.js      decifra, envia, devolve hash — leia inteiro
+    └── version.js   /version e /privacy/manifest
 ```
+
+## O limite
+
+Este serviço prova que **ele** não guarda nada. Ele não prova o que acontece do
+outro lado da chamada — quem opera os disparos guarda os números cifrados com a
+chave pública correspondente e não consegue abri-los, mas isso se verifica no
+código daquele sistema (`node scripts/anon-scan.js`) e no contrato de operador,
+não aqui.
 
 ## Licença
 
