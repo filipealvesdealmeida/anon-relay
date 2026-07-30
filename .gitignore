@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.local
+*.log
+logs/
+coverage/
+.DS_Store
+
+# Nunca versionar planilha de contato neste repositorio — o repositorio e publico
+# e o servico existe justamente pra nao tocar nesse tipo de arquivo.
+*.csv
+*.xlsx

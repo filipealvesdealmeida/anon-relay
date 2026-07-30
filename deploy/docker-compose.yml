@@ -1,0 +1,52 @@
+# Producao — o container sobe SEM sistema de arquivos gravavel.
+#
+# read_only: true nao e enfeite. E a garantia estrutural de que nenhuma linha
+# de codigo, presente ou futura, consegue escrever uma planilha, um log de
+# telefone ou um dump em disco: o kernel recusa. O unico ponto gravavel e um
+# tmpfs de 16MB em /tmp, que morre com o container.
+#
+# Uso na VPS:
+#   docker compose --env-file .env --env-file .env.build up -d
+# (.env.build e escrito pelo workflow de deploy com o digest da imagem)
+
+services:
+  anon-relay:
+    image: ${ANON_IMAGE}
+    container_name: anon-relay
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      NODE_ENV: production
+      PORT: 3020
+      REDIS_URL: ${REDIS_URL}
+      REDIS_PREFIX: ${REDIS_PREFIX:-anon:}
+      REPORT_TTL_DAYS: ${REPORT_TTL_DAYS:-30}
+      WAMID_TTL_HOURS: ${WAMID_TTL_HOURS:-72}
+      ANON_PEPPER: ${ANON_PEPPER}
+      ANON_TICKET_SECRET: ${ANON_TICKET_SECRET}
+      META_GRAPH_VERSION: ${META_GRAPH_VERSION:-v21.0}
+      META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN}
+      META_APP_SECRET: ${META_APP_SECRET}
+      ANON_SENDERS: ${ANON_SENDERS}
+      DISPATCH_RATE_PER_SECOND: ${DISPATCH_RATE_PER_SECOND:-12}
+      MAX_RECIPIENTS_PER_JOB: ${MAX_RECIPIENTS_PER_JOB:-50000}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      BUILD_COMMIT: ${BUILD_COMMIT}
+      IMAGE_DIGEST: ${IMAGE_DIGEST}
+      DEPLOYED_AT: ${DEPLOYED_AT}
+      RELEASE_TAG: ${RELEASE_TAG}
+      SOURCE_REPO: ${SOURCE_REPO}
+    ports:
+      # Escuta so no loopback: quem publica pra internet e o Apache, com TLS.
+      - '127.0.0.1:3020:3020'
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
